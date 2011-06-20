@@ -12,6 +12,7 @@ import json
 import sys
 import os
 
+
 class UploadHandler(object):
     def __init__(self, bucket):
         self.bucket = bucket
@@ -28,15 +29,21 @@ class UploadHandler(object):
         mask = event.mask - (event.mask & pyinotify.IN_ISDIR)
         maskname = pyinotify.EventsCodes.ALL_VALUES[event.mask]
         if event.pathname.find('-tmp') == -1:
-            keyname = '%s:%s' % (self.hostname, event.pathname)
-            key = self.bucket.get_key(keyname)
-            if key is None:
-                t = Thread(target=self.upload_sstable, args=(
-                           keyname, event.pathname))
-                t.setDaemon(True)
-                t.start()
+            self.execute_upload(event.pathname)
 
-    def upload_sstable(self, keyname, filename):
+    def get_keyname(self, path):
+        return '%s:%s' % (self.hostname, path)
+
+    def execute_upload(self, path, json_file=True):
+        keyname = self.get_keyname(path)
+        key = self.bucket.get_key(keyname)
+        if key is None:
+            t = Thread(target=self.upload_sstable, args=(
+                       keyname, path, json_file))
+            t.setDaemon(True)
+            t.start()
+
+    def upload_sstable(self, keyname, filename, json_file=True):
         self.log.info('Uploading %s' % filename)
 
         def progress(sent, total):
@@ -45,9 +52,10 @@ class UploadHandler(object):
 
         try:
             dirname = os.path.dirname(filename)
-            key = self.bucket.new_key('%s-listdir.json' % keyname)
-            key.set_contents_from_string(
-                json.dumps({dirname: os.listdir(dirname)}))
+            if json_file:
+                key = self.bucket.new_key('%s-listdir.json' % keyname)
+                key.set_contents_from_string(
+                    json.dumps({dirname: os.listdir(dirname)}))
 
             key = self.bucket.new_key(keyname)
             key.set_contents_from_filename(filename, replace=False, cb=progress)
@@ -59,6 +67,7 @@ def main():
     parser = OptionParser(usage='%prog [options] <bucket> <path> [...]')
     parser.add_option('-k', '--aws-key', dest='aws_key', default=None)
     parser.add_option('-s', '--aws-secret', dest='aws_secret', default=None)
+    parser.add_option('-r', '--repair', action='store_true', dest='repair')
     options, args = parser.parse_args()
 
     if len(args) < 2:
@@ -71,13 +80,30 @@ def main():
     s3 = boto.connect_s3(options.aws_key, options.aws_secret)
     bucket = s3.get_bucket(bucket)
     handler = UploadHandler(bucket)
+    if options.repair:
+        for path in paths:
+            keys = bucket.list(delimiter='/', prefix=handler.get_keyname(path)+'/')
+            recent_json = filter(lambda x: x.name.endswith('.json'), keys)
+            if recent_json and len(recent_json):
+                recent_json.sort()
+                recent_json = json.loads(recent_json[-1].get_contents_as_string())
+            else:
+                continue
+            files = [key.name.split('/')[-1] for key in keys]
+            for keyspace_path, db_files in recent_json.items():
+                if keyspace_path != path:
+                    continue
 
-    wm = pyinotify.WatchManager()
-    notifier = pyinotify.Notifier(wm, handler)
-    for path in paths:
-        wm.add_watch(path, pyinotify.IN_MOVED_TO)
-    notifier.loop()
+                for db_file in db_files:
+                    if db_file not in files:
+                        handler.execute_upload(path+'/'+db_file, json_file=False)
+    else:
+        wm = pyinotify.WatchManager()
+        notifier = pyinotify.Notifier(wm, handler)
+        for path in paths:
+            wm.add_watch(path, pyinotify.IN_MOVED_TO)
+        notifier.loop()
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    main()
